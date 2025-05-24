@@ -87,7 +87,8 @@ def one_head_flash_attention_in_for_loop(q: jax.Array, k: jax.Array, v: jax.Arra
 
       # Loads out block to SRAM
       out_i_block = out[i:i+TILE_SIZE, :]
-      new_out_i_block = scaling_factor_for_prev[:, None] * out_i_block + scaling_factor_for_curr[:, None] * current_out_block
+      new_out_i_block = scaling_factor_for_prev[:, None] * s_i_block[:, None] * out_i_block + scaling_factor_for_curr[:, None] * current_out_block
+      new_out_i_block = new_out_i_block / (new_s_i_block[:, None] + 1e-8)
 
       # Writes m block back to HBM
       m = m.at[i:i+TILE_SIZE].set(new_m_i_block)
@@ -96,5 +97,4 @@ def one_head_flash_attention_in_for_loop(q: jax.Array, k: jax.Array, v: jax.Arra
       # Writes o block back to HBM
       out = out.at[i:i+TILE_SIZE, :].set(new_out_i_block)
 
-  # Lastly, divides out by s to obtain the true softmax result
-  return out / s[:, None]
+  return out
