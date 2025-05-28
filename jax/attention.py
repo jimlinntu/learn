@@ -5,6 +5,11 @@ https://arxiv.org/pdf/2205.14135
 """
 import jax
 from jax import numpy as jnp
+from jax.experimental import pallas as pl
+import jax.experimental
+from jax.experimental.pallas import mosaic_gpu
+import jax.experimental.pallas
+import jax.experimental.pallas.gpu
 
 def _validate_q_k_v(q: jax.Array, k: jax.Array, v: jax.Array):
   if not (q.shape == k.shape == v.shape):
@@ -98,3 +103,88 @@ def one_head_flash_attention_in_for_loop(q: jax.Array, k: jax.Array, v: jax.Arra
       out = out.at[i:i+TILE_SIZE, :].set(new_out_i_block)
 
   return out
+
+def one_head_flash_attention_in_pallas(q: jax.Array, k: jax.Array, v: jax.Array):
+  _validate_q_k_v(q, k, v)
+
+  n, d = q.shape
+
+  compiler_params = {"mosaic_gpu": {"dimension_semantics": ["parallel", "sequential"]}}
+
+  # TODO(jimlinntu): Support the case when n is not divisible by tile size
+  TILE_SIZE = 256
+
+  _m, _s, out = pl.pallas_call(
+    _flash_attention_kernel,
+    out_shape=[
+      # m shape
+      jax.ShapeDtypeStruct((n, ), q.dtype),
+      # s shape
+      jax.ShapeDtypeStruct((n, ), q.dtype),
+      # out shape
+      jax.ShapeDtypeStruct(q.shape, q.dtype)
+    ],
+    in_specs=[
+      # q[i:i+TILE_SIZE, :] sharded across its rows
+      pl.BlockSpec((TILE_SIZE, d), index_map=lambda i, j: (i, 0)),
+      # k[j:j+TILE_SIZE, :] sharded across its rows
+      pl.BlockSpec((TILE_SIZE, d), index_map=lambda i, j: (j, 0)),
+      # v[j:j+TILE_SIZE, :] sharded across its rows
+      pl.BlockSpec((TILE_SIZE, d), index_map=lambda i, j: (j, 0)),
+    ],
+    out_specs=[
+      # m[i:i+TILE_SIZE] sharded across its rows
+      pl.BlockSpec((TILE_SIZE, ), index_map=lambda i, j: (i, )),
+      # s[i:i+TILE_SIZE] sharded across its rows
+      pl.BlockSpec((TILE_SIZE, ), index_map=lambda i, j: (i, )),
+      # out[i:i+TILE_SIZE, :] sharded across its rows
+      pl.BlockSpec((TILE_SIZE, d), index_map=lambda i, j: (i, 0)),
+    ],
+    grid=(n // TILE_SIZE, # i is the inner loop which can be parallelized
+          n // TILE_SIZE  # j is the "outer" loop which cannnot be parallelized
+         ),
+    compiler_params=compiler_params,
+    interpret=True,
+  )(q, k, v)
+
+  return out
+
+
+def _flash_attention_kernel(q_ref, k_ref, v_ref, m_ref, s_ref, out_ref):
+  # Initializes when j == 0 which marks the start of the outer loop j
+  # which is not parallelizable
+  @pl.when(pl.program_id(1) == 0)
+  def init_m_and_s_and_out():
+    n, d = out_ref.shape
+    m_ref[...] = jnp.full((n, ), float("-inf"))
+    s_ref[...] = jnp.zeros((n, ))
+    out_ref[...] = jnp.zeros((n, d))
+
+  q_block = q_ref[...]
+  k_block = k_ref[...]
+  v_j_block = v_ref[...]
+  m_i_block = m_ref[...]
+  s_i_block = s_ref[...]
+  out_i_block = out_ref[...]
+
+  # Copied directly from ``one_head_flash_attention_in_for_loop
+  q_k_t_ij_block = jnp.matmul(q_block, k_block.T)
+
+  current_m_block = jnp.max(q_k_t_ij_block, axis=1)
+  new_m_i_block = jnp.maximum(m_i_block, current_m_block)
+
+  softmax_nominator = jnp.exp(q_k_t_ij_block - current_m_block[:, None])
+  current_out_block = jnp.matmul(softmax_nominator, v_j_block)
+  current_s_block = jnp.sum(softmax_nominator, axis=1)
+
+  scaling_factor_for_prev = jnp.exp(m_i_block - new_m_i_block)
+  scaling_factor_for_curr = jnp.exp(current_m_block - new_m_i_block)
+
+  new_s_i_block = scaling_factor_for_prev * s_i_block + scaling_factor_for_curr * current_s_block
+
+  new_out_i_block = scaling_factor_for_prev[:, None] * s_i_block[:, None] * out_i_block + scaling_factor_for_curr[:, None] * current_out_block
+  new_out_i_block = new_out_i_block / (new_s_i_block[:, None] + 1e-8)
+
+  m_ref[...] = new_m_i_block
+  s_ref[...] = new_s_i_block
+  out_ref[...] = new_out_i_block
