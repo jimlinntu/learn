@@ -34,9 +34,9 @@ class TestMoe(unittest.TestCase):
         self.K = 3  # Top-k experts to route to
         # Expert's capacity:
         # If tokens are distributed perfectly equal, each device will get:
-        # (BTK // num_expert_parallelim) tokens. Adding a 2 to leave some headroom
-        # on each device.
-        self.EC = int(
+        # (BTK // num_expert_parallelim) tokens. Adding a 2 multiplier to leave
+        # some headroom on each device.
+        self.expert_capacity_per_device = int(
             (self.B * self.T * self.K) // self.num_expert_parallelism * 2)
 
         self.input_sharding = jax.NamedSharding(self.mesh, spec=P(("x", "y")))
@@ -84,6 +84,7 @@ class TestMoe(unittest.TestCase):
         np.testing.assert_allclose(result, self.inputs, rtol=1e-6)
 
     def test_ragged_all_to_all_moe(self):
+        self.skipTest("Skips because ragged_all_to_all is not supported on CPU.")
         result = jax.jit(
             functools.partial(
                 _ragged_all_to_all_moe,
@@ -101,47 +102,147 @@ class TestMoe(unittest.TestCase):
 
         # Creates fake tokens to test distributing these
         # tokens to devices and bringing them back
-        fake_tokens = jax.vmap(lambda _: jnp.arange(0, num_tokens_per_device))(jnp.arange(0, self.device_count)).reshape(
-            num_tokens_per_device * self.device_count
-        )
+        fake_tokens = jnp.arange(0, num_tokens_per_device *
+                                 self.device_count).reshape(
+                                     -1,
+                                     # 1 represents the hidden dimension
+                                     1)
 
+        # Ideally, each device should get in average
+        # `num_tokens_per_device` number of tokens when distributed evenly
+        # but in practice, we want to leave some headroom.
+        # So I multiply the number by `4` here.
+        expert_capacity_per_device = num_tokens_per_device * 4
+        expert_capacity_per_expert = (expert_capacity_per_device *
+                                      self.y) // self.E
+
+        # This simulates the expert routing results (to which expert indices)
         fake_expert_indices = jax.random.randint(jax.random.key(1234),
                                                  shape=(num_tokens_per_device *
                                                         self.device_count, ),
                                                  minval=0,
                                                  maxval=self.E)
+        # Each expert does: f_expert(x) = x + expert_index (for testing)
+        fake_experts = jnp.arange(0, self.E).reshape(self.E, 1)
 
         fake_expert_indices = jax.device_put(fake_expert_indices,
                                              self.input_sharding)
         fake_tokens = jax.device_put(fake_tokens, self.input_sharding)
-        
-        @jax.shard_map(
-            in_specs=(self.input_sharding.spec, self.input_sharding.spec),
-            out_specs=(),
-            mesh=self.mesh,
-            check_vma=False)
-        def _func(local_tokens, local_expert_indices):
-            sorter = jnp.argsort(local_expert_indices)
+        fake_experts = jax.device_put(fake_experts, self.expert_sharding)
 
+        pad_value = -1000
+
+        expected_result = fake_tokens + fake_expert_indices.reshape(-1, 1)
+
+        @jax.shard_map(in_specs=(self.input_sharding.spec,
+                                 self.input_sharding.spec,
+                                 self.expert_sharding.spec),
+                       out_specs=(self.input_sharding.spec),
+                       mesh=self.mesh,
+                       check_vma=False)
+        def _func(local_tokens, local_expert_indices, local_expert_param):
+            sorter = jnp.argsort(local_expert_indices)
+            unsorter = jnp.argsort(sorter)
+
+            # Sorted so that tokens belonging to the each experts are next to each other
             sorted_local_tokens = local_tokens[sorter]
             sorted_expert_indices = local_expert_indices[sorter]
+            num_tokens, hidden_dim = local_tokens.shape
 
-            device_expert_start_indices = _get_device_expert_start_indices(self.E, self.num_expert_parallelism)
+            num_devices = jax.lax.axis_size("y")
 
-            input_offsets = jnp.searchsorted(sorted_expert_indices,
-                                            device_expert_start_indices)
-            # jax.debug.print("sorted tokens {}, sorted indices: {}, input_offsets: {}", sorted_local_tokens, sorted_expert_indices, input_offsets)
+            all_expert_indices = _get_expert_indices(self.E)
+            assert all_expert_indices.shape == (self.E, )
+            # O(E log num_tokens) to find all the offsets via binary searches (not sure how is this performance?)
+            expert_start_offsets = jnp.searchsorted(sorted_expert_indices,
+                                                    all_expert_indices)
+            assert expert_start_offsets.shape == (self.E, )
+            num_tokens_send_to_each_expert = jnp.concat(
+                [expert_start_offsets[1:],
+                 jnp.array([num_tokens])]) - expert_start_offsets
+            assert num_tokens_send_to_each_expert.shape == (self.E, )
 
+            # Useful for debugging
+            if False:
+                jax.debug.print(
+                    "sorted tokens {}, sorted indices: {}, value: {}",
+                    sorted_local_tokens.reshape(-1), sorted_expert_indices,
+                    num_tokens_send_to_each_expert)
 
-            num_tokens = sorted_expert_indices.shape[0]
-            send_sizes, recv_sizes, output_offsets = _compute_ragged_all_to_all_info(num_tokens, input_offsets)
-            xidx, yidx = jax.lax.axis_index("x"), jax.lax.axis_index("y")
-            jax.debug.print("(x, y) = ({}, {}), sorted_expert_indices: {}, input_offsets: {}, send_sizes: {}, recv_sizes: {}, output_offsets: {}",
-                            xidx, yidx, sorted_expert_indices, input_offsets, send_sizes, recv_sizes, output_offsets)
+            # Pads the first dimension for `dynamic_slice_in_dim` later.
+            # This is needed because the last device might not get any tokens so
+            # slicing via [offset:offset+expert_capacity_per_expert] will not go out of bound
+            padded_sorted_local_tokens = jnp.pad(
+                sorted_local_tokens, ((0, expert_capacity_per_expert), (0, 0)))
 
-        
-        _func(fake_tokens, fake_expert_indices)
-        raise ValueError(fake_expert_indices.addressable_shards[1])
+            def _slice_tokens(expert_idx):
+                offset = expert_start_offsets[expert_idx]
+                tokens = jax.lax.dynamic_slice_in_dim(
+                    # Use the padded version due to static `slice_size`
+                    operand=padded_sorted_local_tokens,
+                    start_index=offset,
+                    # Due to XLA's static shape, constraint,
+                    # we need to grab `expert_capacity_per_device` here
+                    slice_size=expert_capacity_per_expert,
+                    axis=0)
+                # Generates a mask for putting garbage values
+                # i.e. tokens[offset+size:] = -1000 (make it large for easier debugging)
+                size = num_tokens_send_to_each_expert[expert_idx]
+                mask: jax.Array = jnp.where(
+                    jnp.arange(0, expert_capacity_per_expert) < size, 1, 0)
+                tokens = (mask[..., None] *
+                          tokens) + (1 - mask[..., None]) * jnp.broadcast_to(
+                              pad_value, tokens.shape)
+                return tokens
+
+            tokens_to_send: jax.Array = jax.vmap(_slice_tokens)(
+                all_expert_indices)
+            assert tokens_to_send.shape == (self.E, expert_capacity_per_expert,
+                                            hidden_dim)
+
+            tokens_to_me = jax.lax.all_to_all(
+                tokens_to_send,
+                axis_name="y",  # Expert parallelism axis
+                split_axis=0,
+                concat_axis=1,
+                tiled=True,
+            )
+            num_local_experts = local_expert_param.shape[0]
+            assert tokens_to_me.shape == (
+                num_local_experts,
+                # This dimension is concatenated
+                self.y * expert_capacity_per_expert,
+                local_tokens.shape[-1])
+
+            # Applies expert's parameter to each token
+            mask = tokens_to_me != pad_value
+            applied_tokens = tokens_to_me + local_expert_param.reshape(
+                num_local_experts, 1, 1)
+            applied_tokens = jnp.where(mask, applied_tokens, pad_value)
+
+            # Bring those tokens back their original devices
+            applied_tokens = jax.lax.all_to_all(applied_tokens,
+                                                axis_name="y",
+                                                split_axis=1,
+                                                concat_axis=0,
+                                                tiled=True)
+            assert applied_tokens.shape == (self.E, expert_capacity_per_expert,
+                                            hidden_dim)
+
+            # Brings back the tokens into (num_tokens, hidden_dim)
+            # using the sorting trick to push all the padding values to the back
+            applied_tokens = applied_tokens.reshape(-1, hidden_dim)
+            discard_padding_sorter = jnp.argsort(
+                jnp.where(applied_tokens[..., 0] != pad_value, 0, 1))
+
+            # We know that [:num_tokens] is all the tokens we need (after the sorting)
+            # and all the padding values are on the back
+            result = applied_tokens[discard_padding_sorter][:num_tokens]
+            assert result.shape == (num_tokens, hidden_dim)
+            return result[unsorter]
+
+        got_result = _func(fake_tokens, fake_expert_indices, fake_experts)
+        np.testing.assert_array_equal(got_result, expected_result)
 
 
 def _naive_moe(inputs: jax.Array, router_param: jax.Array, experts: jax.Array,
@@ -288,8 +389,13 @@ def _get_device_expert_start_indices(num_experts: int,
     return jnp.arange(start=0, stop=num_experts, step=num_experts_per_device)
 
 
-def _compute_ragged_all_to_all_info(num_tokens: int,
-                                    input_offsets: jax.Array):
+def _get_expert_indices(num_experts: int):
+    return jnp.arange(0, num_experts)
+
+
+# TODO: Revisit when `jax.lax.ragged_all_to_all` is available on CPUs.
+# https://github.com/jax-ml/jax/issues/34755
+def _compute_ragged_all_to_all_info(num_tokens: int, input_offsets: jax.Array):
     """Computes info needed for `ragged_all_to_all` in `jax.shard_map`."""
 
     send_sizes = jnp.concat([input_offsets[1:],
@@ -302,7 +408,8 @@ def _compute_ragged_all_to_all_info(num_tokens: int,
         concat_axis=0,
         tiled=False,  # not need to tile because len(send_sizes) == |y|
     )
-    send_to_me_offsets = jnp.concat([jnp.array([0]), jnp.cumsum(recv_sizes, axis=0)[:-1]])
+    send_to_me_offsets = jnp.concat(
+        [jnp.array([0]), jnp.cumsum(recv_sizes, axis=0)[:-1]])
     me_to_dst_offsets = jax.lax.all_to_all(
         send_to_me_offsets,
         axis_name="y",
